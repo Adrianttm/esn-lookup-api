@@ -18,12 +18,11 @@ app.use(cors({
 
 app.use(express.json());
 
-// Browser-like headers
+// Browser-like headers (no gzip to avoid decompression issues)
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   'Accept': 'application/json, text/plain, */*',
   'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
   'Referer': 'https://parts.cummins.com/',
   'Origin': 'https://parts.cummins.com',
   'Connection': 'keep-alive',
@@ -89,11 +88,7 @@ async function getCumminsSession() {
   console.log('[Session] Auth response status:', res.status);
   console.log('[Session] Set-Cookie count:', res.setCookies.length);
 
-  if (res.status !== 200) {
-    console.log('[Session] Response body:', res.body.substring(0, 500));
-    throw new Error('Cummins auth failed with status ' + res.status);
-  }
-
+  // The auth endpoint may return 401 but still set valid session cookies
   const setCookies = res.setCookies;
   const cookieString = setCookies.map(c => c.split(';')[0]).join('; ');
 
@@ -110,8 +105,11 @@ async function getCumminsSession() {
 
   if (!xsrfToken) {
     console.log('[Session] All cookies:', JSON.stringify(setCookies));
-    throw new Error('Could not extract XSRF token from Cummins session');
+    console.log('[Session] Response body:', res.body.substring(0, 500));
+    throw new Error('Could not extract XSRF token (status ' + res.status + ')');
   }
+
+  console.log('[Session] Got XSRF token despite status', res.status);
 
   cachedCookies = cookieString;
   cachedXsrfToken = xsrfToken;
@@ -154,6 +152,7 @@ app.get('/api/lookup/:esn', async (req, res) => {
     });
 
     console.log('[Lookup] Dataplate response status:', dataplateRes.status);
+    console.log('[Lookup] Dataplate body preview:', dataplateRes.body.substring(0, 200));
 
     if (dataplateRes.status === 403) {
       console.log('[Lookup] Got 403, refreshing session...');
