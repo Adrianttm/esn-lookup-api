@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const puppeteer = require('puppeteer');
 const https = require('https');
 
 const app = express();
@@ -18,23 +19,118 @@ app.use(cors({
 
 app.use(express.json());
 
-// Browser-like headers (no gzip to avoid decompression issues)
-const BROWSER_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Referer': 'https://parts.cummins.com/',
-  'Origin': 'https://parts.cummins.com',
-  'Connection': 'keep-alive',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-origin',
-  'Sec-Ch-Ua': '"Chromium";v="131", "Not_A Brand";v="24"',
-  'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"Windows"'
-};
+// Session cache
+let cachedCookies = null;
+let cachedXsrfToken = null;
+let sessionExpiry = 0;
+let browser = null;
 
-// Helper: make HTTPS request (native, to get raw set-cookie)
+// Launch or reuse a persistent browser instance
+async function getBrowser() {
+  if (browser && browser.isConnected()) {
+    return browser;
+  }
+  console.log('[Browser] Launching new Chromium instance...');
+  browser = await puppeteer.launch({
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-extensions'
+    ]
+  });
+  console.log('[Browser] Chromium launched successfully.');
+  return browser;
+}
+
+// Use a real browser to visit parts.cummins.com and get valid session cookies
+async function getCumminsSession() {
+  const now = Date.now();
+
+  if (cachedCookies && cachedXsrfToken && now < sessionExpiry) {
+    return { cookies: cachedCookies, xsrfToken: cachedXsrfToken };
+  }
+
+  console.log('[Session] Getting new Cummins session via headless browser...');
+
+  const br = await getBrowser();
+  const page = await br.newPage();
+
+  try {
+    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    );
+
+    console.log('[Session] Navigating to parts.cummins.com...');
+    await page.goto('https://parts.cummins.com', {
+      waitUntil: 'networkidle2',
+      timeout: 30000
+    });
+
+    console.log('[Session] Page loaded. Extracting cookies...');
+
+    const cookies = await page.cookies();
+    console.log('[Session] Total cookies:', cookies.length);
+
+    let cookieString = cookies.map(c => c.name + '=' + c.value).join('; ');
+
+    let xsrfToken = null;
+    for (const cookie of cookies) {
+      if (cookie.name === 'XSRF-TOKEN') {
+        xsrfToken = decodeURIComponent(cookie.value);
+        break;
+      }
+    }
+
+    if (!xsrfToken || xsrfToken.length < 10) {
+      console.log('[Session] No XSRF from page load, trying publicUser API...');
+
+      const authResponse = await page.evaluate(async () => {
+        const res = await fetch('/gateway/auth/login/publicUser', {
+          method: 'GET',
+          credentials: 'include',
+          headers: { 'Accept': 'application/json' }
+        });
+        return { status: res.status, ok: res.ok };
+      });
+
+      console.log('[Session] publicUser response:', authResponse.status);
+
+      const updatedCookies = await page.cookies();
+      cookieString = updatedCookies.map(c => c.name + '=' + c.value).join('; ');
+
+      for (const cookie of updatedCookies) {
+        if (cookie.name === 'XSRF-TOKEN' && cookie.value.length > 10) {
+          xsrfToken = decodeURIComponent(cookie.value);
+          break;
+        }
+      }
+
+      if (!xsrfToken || xsrfToken.length < 10) {
+        console.log('[Session] Cookie names:', updatedCookies.map(c => c.name + '=' + c.value.substring(0, 20)).join(', '));
+        throw new Error('Could not get valid XSRF token from Cummins');
+      }
+    }
+
+    cachedCookies = cookieString;
+    cachedXsrfToken = xsrfToken;
+    sessionExpiry = now + 25 * 60 * 1000;
+
+    console.log('[Session] Session established! XSRF token length:', xsrfToken.length);
+    return { cookies: cachedCookies, xsrfToken: cachedXsrfToken };
+
+  } finally {
+    await page.close();
+  }
+}
+
+// Helper: make HTTPS request with session cookies
 function httpsGet(url, headers) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
@@ -49,13 +145,7 @@ function httpsGet(url, headers) {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
-        resolve({
-          status: res.statusCode,
-          headers: res.headers,
-          rawHeaders: res.rawHeaders,
-          setCookies: res.headers['set-cookie'] || [],
-          body: data
-        });
+        resolve({ status: res.statusCode, body: data });
       });
     });
 
@@ -65,58 +155,6 @@ function httpsGet(url, headers) {
     });
     req.end();
   });
-}
-
-// Session cache
-let cachedCookies = null;
-let cachedXsrfToken = null;
-let sessionExpiry = 0;
-
-async function getCumminsSession() {
-  const now = Date.now();
-
-  if (cachedCookies && cachedXsrfToken && now < sessionExpiry) {
-    return { cookies: cachedCookies, xsrfToken: cachedXsrfToken };
-  }
-
-  console.log('[Session] Fetching new Cummins public session...');
-
-  const res = await httpsGet('https://parts.cummins.com/gateway/auth/login/publicUser', {
-    ...BROWSER_HEADERS
-  });
-
-  console.log('[Session] Auth response status:', res.status);
-  console.log('[Session] Set-Cookie count:', res.setCookies.length);
-
-  // The auth endpoint may return 401 but still set valid session cookies
-  const setCookies = res.setCookies;
-  const cookieString = setCookies.map(c => c.split(';')[0]).join('; ');
-
-  console.log('[Session] Cookie string:', cookieString.substring(0, 200));
-
-  let xsrfToken = null;
-  for (const cookie of setCookies) {
-    const match = cookie.match(/XSRF-TOKEN=([^;]+)/);
-    if (match) {
-      xsrfToken = decodeURIComponent(match[1]);
-      break;
-    }
-  }
-
-  if (!xsrfToken) {
-    console.log('[Session] All cookies:', JSON.stringify(setCookies));
-    console.log('[Session] Response body:', res.body.substring(0, 500));
-    throw new Error('Could not extract XSRF token (status ' + res.status + ')');
-  }
-
-  console.log('[Session] Got XSRF token despite status', res.status);
-
-  cachedCookies = cookieString;
-  cachedXsrfToken = xsrfToken;
-  sessionExpiry = now + 30 * 60 * 1000;
-
-  console.log('[Session] New session established. XSRF token length:', xsrfToken.length);
-  return { cookies: cookieString, xsrfToken };
 }
 
 // ESN Lookup endpoint
@@ -146,13 +184,16 @@ app.get('/api/lookup/:esn', async (req, res) => {
     console.log('[Lookup] Calling dataplate API for ESN:', esn);
 
     const dataplateRes = await httpsGet(dataplateUrl, {
-      ...BROWSER_HEADERS,
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Referer': 'https://parts.cummins.com/',
+      'Origin': 'https://parts.cummins.com',
       'X-XSRF-TOKEN': session.xsrfToken,
       'Cookie': session.cookies
     });
 
     console.log('[Lookup] Dataplate response status:', dataplateRes.status);
-    console.log('[Lookup] Dataplate body preview:', dataplateRes.body.substring(0, 200));
 
     if (dataplateRes.status === 403) {
       console.log('[Lookup] Got 403, refreshing session...');
@@ -162,7 +203,11 @@ app.get('/api/lookup/:esn', async (req, res) => {
       const freshSession = await getCumminsSession();
 
       const retryRes = await httpsGet(dataplateUrl, {
-        ...BROWSER_HEADERS,
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Referer': 'https://parts.cummins.com/',
+        'Origin': 'https://parts.cummins.com',
         'X-XSRF-TOKEN': freshSession.xsrfToken,
         'Cookie': freshSession.cookies
       });
@@ -178,6 +223,7 @@ app.get('/api/lookup/:esn', async (req, res) => {
     }
 
     if (dataplateRes.status !== 200) {
+      console.log('[Lookup] Response body:', dataplateRes.body.substring(0, 300));
       throw new Error('Cummins API returned ' + dataplateRes.status);
     }
 
@@ -215,7 +261,14 @@ function formatResponse(data, esn) {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'esn-lookup-api' });
+  res.json({ status: 'ok', service: 'esn-lookup-api', browser: browser ? 'running' : 'not started' });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('[Server] Shutting down...');
+  if (browser) await browser.close();
+  process.exit(0);
 });
 
 // Start server
